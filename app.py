@@ -8,9 +8,6 @@ import base64
 from pathlib import Path
 from datetime import date, datetime
 
-# Supabase client
-from supabase import create_client, Client
-
 st.set_page_config(page_title="SGA - IDP", page_icon="⚽", layout="wide")
 
 ADMIN_PASSWORD = os.getenv("SGA_ADMIN_PASSWORD", "changeme")
@@ -129,247 +126,131 @@ def logout_admin():
 
 
 # ---------------------------
-# Database helpers (Supabase)
+# In-memory store (preview — nothing persisted to disk/DB)
 # ---------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL") or (st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None)
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") or (st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None)
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    st.warning("Supabase não está configurado. Defina SUPABASE_URL e SUPABASE_KEY nas variáveis de ambiente / secrets.")
-    supabase = None
-else:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-def _resp_error(resp):
-    if resp is None:
-        return "No response from Supabase"
-    try:
-        err_attr = getattr(resp, "error", None)
-        if err_attr:
-            return err_attr
-    except Exception:
-        pass
-    try:
-        if isinstance(resp, dict) and resp.get("error"):
-            return resp.get("error")
-        get_err = getattr(resp, "get", None)
-        if callable(get_err):
-            err = resp.get("error", None)
-            if err:
-                return err
-    except Exception:
-        pass
-    try:
-        code = getattr(resp, "status_code", None)
-        if code is not None and not (200 <= int(code) < 300):
-            data = getattr(resp, "data", None)
-            return f"status={code}, data={data}"
-    except Exception:
-        pass
-    return None
+def _empty_store():
+    return {
+        "players": [],
+        "evaluations": [],
+        "eval_skills": [],
+        "eval_mog": [],
+        "eval_notes": [],
+        "_next_id": {"players": 1, "evaluations": 1},
+    }
 
 
-def _resp_data(resp):
-    if resp is None:
-        return None
-    try:
-        return getattr(resp, "data", None)
-    except Exception:
-        try:
-            return resp.get("data")
-        except Exception:
-            return None
+def _seed_demo_store(store):
+    """Sample player + evaluation so the dashboard renders without setup."""
+    pid, eid = 1, 1
+    pos = "ST"
+    store["players"].append({
+        "id": pid,
+        "name": "Alex Demo",
+        "position": pos,
+        "club": "SGA Preview",
+        "photo_url": "",
+    })
+    store["evaluations"].append({
+        "id": eid,
+        "player_id": pid,
+        "analyst": "Analista Demo",
+        "eval_date": date.today().isoformat(),
+    })
+    for i, s in enumerate(POSITION_SKILLS[pos]):
+        store["eval_skills"].append({
+            "evaluation_id": eid,
+            "category": "technical",
+            "skill_name": s,
+            "level": LEVELS[i % len(LEVELS)],
+        })
+    for name, level in [
+        ("Pace", "Good"),
+        ("Work Rate", "Above Level"),
+        ("Hold-up Play", "Average"),
+        ("Movement", "Good"),
+    ]:
+        store["eval_skills"].append({
+            "evaluation_id": eid,
+            "category": "player_specific",
+            "skill_name": name,
+            "level": level,
+        })
+    for i, s in enumerate(MENTAL_SKILLS):
+        store["eval_skills"].append({
+            "evaluation_id": eid,
+            "category": "mental",
+            "skill_name": s,
+            "level": LEVELS[(i + 1) % len(LEVELS)],
+        })
+    for i, c in enumerate(MOG_CATEGORIES):
+        store["eval_mog"].append({
+            "evaluation_id": eid,
+            "category": c,
+            "value": [72, 68, 80, 75, 60][i],
+        })
+    for i, text in enumerate(
+        ["Finalização consistente", "Boa movimentação na área", "Pressing eficiente"], 1
+    ):
+        store["eval_notes"].append({
+            "evaluation_id": eid,
+            "note_type": "strength",
+            "position": i,
+            "text": text,
+        })
+    for i, text in enumerate(["Jogo aéreo", "Passe sob pressão"], 1):
+        store["eval_notes"].append({
+            "evaluation_id": eid,
+            "note_type": "improve",
+            "position": i,
+            "text": text,
+        })
+    store["_next_id"]["players"] = 2
+    store["_next_id"]["evaluations"] = 2
 
 
-def init_db():
-    return
+def _mem_store():
+    if "_mem_store" not in st.session_state:
+        st.session_state["_mem_store"] = _empty_store()
+        _seed_demo_store(st.session_state["_mem_store"])
+    return st.session_state["_mem_store"]
 
 
-init_db()
+def _next_id(store, entity: str) -> int:
+    nid = int(store["_next_id"][entity])
+    store["_next_id"][entity] = nid + 1
+    return nid
 
 
-def get_players():
-    if not supabase:
-        return pd.DataFrame(columns=["id", "name", "position", "club", "photo_url"])
-    resp = supabase.table("players").select("*").execute()
-    err = _resp_error(resp)
-    if err:
-        st.warning(f"Warning fetching players: {err}")
-        return pd.DataFrame(columns=["id", "name", "position", "club", "photo_url"])
-    data = _resp_data(resp) or []
-    df = pd.DataFrame(data)
-    if not df.empty and "name" in df.columns:
-        df = df.sort_values("name").reset_index(drop=True)
-    return df
+def _player_name_exists(store, name: str, exclude_id=None) -> bool:
+    n = name.strip().lower()
+    for p in store["players"]:
+        if exclude_id is not None and p["id"] == exclude_id:
+            continue
+        if p.get("name", "").strip().lower() == n:
+            return True
+    return False
 
 
-def add_player(name, position, club, photo_url):
-    if not supabase:
-        raise Exception("Supabase não configurado.")
-    payload = {"name": name, "position": position, "club": club, "photo_url": photo_url}
-    resp = supabase.table("players").insert(payload).execute()
-    err = _resp_error(resp)
-    if err:
-        raise Exception(err if isinstance(err, str) else str(err))
-    return _resp_data(resp)
+def _purge_evaluations_for_player(store, player_id: int):
+    eids = [e["id"] for e in store["evaluations"] if e["player_id"] == player_id]
+    store["evaluations"] = [e for e in store["evaluations"] if e["player_id"] != player_id]
+    for table in ("eval_skills", "eval_mog", "eval_notes"):
+        store[table] = [r for r in store[table] if r.get("evaluation_id") not in eids]
 
 
-def delete_player(player_id: int):
-    if not supabase:
-        raise Exception("Supabase não configurado.")
-    resp = supabase.table("players").delete().eq("id", player_id).execute()
-    err = _resp_error(resp)
-    if err:
-        raise Exception(err if isinstance(err, str) else str(err))
-    return _resp_data(resp)
-
-
-def update_player(player_id: int, name: str, position: str, club: str, photo_url: str):
-    if not supabase:
-        raise Exception("Supabase não configurado.")
-    payload = {"name": name.strip(), "position": position.strip(), "club": club.strip(), "photo_url": photo_url.strip()}
-    resp = supabase.table("players").update(payload).eq("id", player_id).execute()
-    err = _resp_error(resp)
-    if err:
-        raise Exception(err if isinstance(err, str) else str(err))
-    return _resp_data(resp)
-
-
-def save_evaluation(player_id, analyst, eval_date, skills, mog, strengths, improvements):
-    if not supabase:
-        raise Exception("Supabase não configurado.")
-    ev = {"player_id": player_id, "analyst": analyst, "eval_date": eval_date}
-    resp = supabase.table("evaluations").insert(ev).execute()
-    err = _resp_error(resp)
-    if err:
-        raise Exception(err if isinstance(err, str) else str(err))
-    edata = _resp_data(resp) or []
-    if not edata:
-        raise Exception("Falha ao criar avaliação (resposta vazia)")
-    eid = edata[0]["id"]
-
-    rows = []
-    for cat, sd in (skills or {}).items():
-        for sn, lv in sd.items():
-            if str(sn).strip() and str(lv).strip():
-                rows.append({"evaluation_id": eid, "category": cat, "skill_name": sn.strip(), "level": lv.strip()})
-    if rows:
-        r = supabase.table("eval_skills").insert(rows).execute()
-        e = _resp_error(r)
-        if e:
-            raise Exception(e)
-
-    rows = [{"evaluation_id": eid, "category": c, "value": int(v)} for c, v in (mog or {}).items()]
-    if rows:
-        r = supabase.table("eval_mog").insert(rows).execute()
-        e = _resp_error(r)
-        if e:
-            raise Exception(e)
-
-    rows = []
-    for i, t in enumerate(strengths or []):
-        if str(t).strip():
-            rows.append({"evaluation_id": eid, "note_type": "strength", "position": i + 1, "text": t.strip()})
-    for i, t in enumerate(improvements or []):
-        if str(t).strip():
-            rows.append({"evaluation_id": eid, "note_type": "improve", "position": i + 1, "text": t.strip()})
-    if rows:
-        r = supabase.table("eval_notes").insert(rows).execute()
-        e = _resp_error(r)
-        if e:
-            raise Exception(e)
-
-    return eid
-
-
-def update_evaluation_meta(evaluation_id: int, analyst: str, eval_date: str):
-    if not supabase:
-        raise Exception("Supabase não configurado.")
-    resp = supabase.table("evaluations").update({"analyst": analyst, "eval_date": eval_date}).eq("id", evaluation_id).execute()
-    err = _resp_error(resp)
-    if err:
-        raise Exception(err if isinstance(err, str) else str(err))
-    return _resp_data(resp)
-
-
-def replace_evaluation_content(evaluation_id: int, skills: dict, mog: dict, strengths: list, improvements: list):
-    if not supabase:
-        raise Exception("Supabase não configurado.")
-    r = supabase.table("eval_skills").delete().eq("evaluation_id", evaluation_id).execute()
-    e = _resp_error(r)
-    if e:
-        raise Exception(e)
-    r = supabase.table("eval_mog").delete().eq("evaluation_id", evaluation_id).execute()
-    e = _resp_error(r)
-    if e:
-        raise Exception(e)
-    r = supabase.table("eval_notes").delete().eq("evaluation_id", evaluation_id).execute()
-    e = _resp_error(r)
-    if e:
-        raise Exception(e)
-
-    rows = []
-    for cat, sd in (skills or {}).items():
-        for sn, lv in sd.items():
-            if str(sn).strip() and str(lv).strip():
-                rows.append({"evaluation_id": evaluation_id, "category": cat, "skill_name": sn.strip(), "level": lv.strip()})
-    if rows:
-        r = supabase.table("eval_skills").insert(rows).execute()
-        e = _resp_error(r)
-        if e:
-            raise Exception(e)
-
-    rows = [{"evaluation_id": evaluation_id, "category": c, "value": int(v)} for c, v in (mog or {}).items()]
-    if rows:
-        r = supabase.table("eval_mog").insert(rows).execute()
-        e = _resp_error(r)
-        if e:
-            raise Exception(e)
-
-    rows = []
-    for i, t in enumerate(strengths or []):
-        if str(t).strip():
-            rows.append({"evaluation_id": evaluation_id, "note_type": "strength", "position": i + 1, "text": t.strip()})
-    for i, t in enumerate(improvements or []):
-        if str(t).strip():
-            rows.append({"evaluation_id": evaluation_id, "note_type": "improve", "position": i + 1, "text": t.strip()})
-    if rows:
-        r = supabase.table("eval_notes").insert(rows).execute()
-        e = _resp_error(r)
-        if e:
-            raise Exception(e)
-
-
-def get_latest_evaluation(player_id):
-    if not supabase:
-        return None
-    resp = supabase.table("evaluations").select("*").eq("player_id", player_id).execute()
-    err = _resp_error(resp)
-    if err:
-        st.warning(f"Warning fetching evaluations: {err}")
-        return None
-    evs = _resp_data(resp) or []
-    if not evs:
-        return None
-    evs_sorted = sorted(evs, key=lambda x: (x.get("eval_date") or "", x.get("id") or 0), reverse=True)
-    ev = evs_sorted[0]
+def _assemble_evaluation(store, ev: dict) -> dict:
     eid = ev["id"]
-
     skills = {}
-    resp = supabase.table("eval_skills").select("category,skill_name,level").eq("evaluation_id", eid).execute()
-    for r in (_resp_data(resp) or []):
+    for r in store["eval_skills"]:
+        if r.get("evaluation_id") != eid:
+            continue
         skills.setdefault(r["category"], {})[r["skill_name"]] = r["level"]
-
     mog = {}
-    resp = supabase.table("eval_mog").select("category,value").eq("evaluation_id", eid).execute()
-    for r in (_resp_data(resp) or []):
-        mog[r["category"]] = r["value"]
-
-    strengths = []
-    improvements = []
-    resp = supabase.table("eval_notes").select("note_type,position,text").eq("evaluation_id", eid).execute()
-    notes = _resp_data(resp) or []
+    for r in store["eval_mog"]:
+        if r.get("evaluation_id") == eid:
+            mog[r["category"]] = r["value"]
+    strengths, improvements = [], []
+    notes = [r for r in store["eval_notes"] if r.get("evaluation_id") == eid]
     try:
         notes_sorted = sorted(notes, key=lambda r: int(r.get("position") or 0))
     except Exception:
@@ -379,7 +260,6 @@ def get_latest_evaluation(player_id):
             strengths.append(r.get("text"))
         else:
             improvements.append(r.get("text"))
-
     return {
         "id": eid,
         "analyst": ev.get("analyst"),
@@ -389,6 +269,124 @@ def get_latest_evaluation(player_id):
         "strengths": strengths,
         "improvements": improvements,
     }
+
+
+def _write_eval_content(store, evaluation_id: int, skills: dict, mog: dict, strengths: list, improvements: list):
+    store["eval_skills"] = [r for r in store["eval_skills"] if r.get("evaluation_id") != evaluation_id]
+    store["eval_mog"] = [r for r in store["eval_mog"] if r.get("evaluation_id") != evaluation_id]
+    store["eval_notes"] = [r for r in store["eval_notes"] if r.get("evaluation_id") != evaluation_id]
+
+    for cat, sd in (skills or {}).items():
+        for sn, lv in sd.items():
+            if str(sn).strip() and str(lv).strip():
+                store["eval_skills"].append({
+                    "evaluation_id": evaluation_id,
+                    "category": cat,
+                    "skill_name": sn.strip(),
+                    "level": lv.strip(),
+                })
+    for c, v in (mog or {}).items():
+        store["eval_mog"].append({
+            "evaluation_id": evaluation_id,
+            "category": c,
+            "value": int(v),
+        })
+    for i, t in enumerate(strengths or []):
+        if str(t).strip():
+            store["eval_notes"].append({
+                "evaluation_id": evaluation_id,
+                "note_type": "strength",
+                "position": i + 1,
+                "text": t.strip(),
+            })
+    for i, t in enumerate(improvements or []):
+        if str(t).strip():
+            store["eval_notes"].append({
+                "evaluation_id": evaluation_id,
+                "note_type": "improve",
+                "position": i + 1,
+                "text": t.strip(),
+            })
+
+
+def get_players():
+    store = _mem_store()
+    df = pd.DataFrame(store["players"])
+    if df.empty:
+        return pd.DataFrame(columns=["id", "name", "position", "club", "photo_url"])
+    if "name" in df.columns:
+        df = df.sort_values("name").reset_index(drop=True)
+    return df
+
+
+def add_player(name, position, club, photo_url):
+    store = _mem_store()
+    if _player_name_exists(store, name):
+        raise Exception("duplicate: player name already exists")
+    pid = _next_id(store, "players")
+    row = {"id": pid, "name": name, "position": position, "club": club, "photo_url": photo_url}
+    store["players"].append(row)
+    return [row]
+
+
+def delete_player(player_id: int):
+    store = _mem_store()
+    _purge_evaluations_for_player(store, player_id)
+    store["players"] = [p for p in store["players"] if p["id"] != player_id]
+    return []
+
+
+def update_player(player_id: int, name: str, position: str, club: str, photo_url: str):
+    store = _mem_store()
+    if _player_name_exists(store, name, exclude_id=player_id):
+        raise Exception("duplicate: player name already exists")
+    updated = None
+    for p in store["players"]:
+        if p["id"] == player_id:
+            p["name"] = name.strip()
+            p["position"] = position.strip()
+            p["club"] = club.strip()
+            p["photo_url"] = photo_url.strip()
+            updated = dict(p)
+            break
+    if updated is None:
+        raise Exception("Jogador não encontrado.")
+    return [updated]
+
+
+def save_evaluation(player_id, analyst, eval_date, skills, mog, strengths, improvements):
+    store = _mem_store()
+    eid = _next_id(store, "evaluations")
+    ev = {"id": eid, "player_id": player_id, "analyst": analyst, "eval_date": eval_date}
+    store["evaluations"].append(ev)
+    _write_eval_content(store, eid, skills, mog, strengths, improvements)
+    return eid
+
+
+def update_evaluation_meta(evaluation_id: int, analyst: str, eval_date: str):
+    store = _mem_store()
+    for ev in store["evaluations"]:
+        if ev["id"] == evaluation_id:
+            ev["analyst"] = analyst
+            ev["eval_date"] = eval_date
+            return [dict(ev)]
+    raise Exception("Avaliação não encontrada.")
+
+
+def replace_evaluation_content(evaluation_id: int, skills: dict, mog: dict, strengths: list, improvements: list):
+    store = _mem_store()
+    if not any(e["id"] == evaluation_id for e in store["evaluations"]):
+        raise Exception("Avaliação não encontrada.")
+    _write_eval_content(store, evaluation_id, skills, mog, strengths, improvements)
+
+
+def get_latest_evaluation(player_id):
+    store = _mem_store()
+    evs = [e for e in store["evaluations"] if e.get("player_id") == player_id]
+    if not evs:
+        return None
+    evs_sorted = sorted(evs, key=lambda x: (x.get("eval_date") or "", x.get("id") or 0), reverse=True)
+    return _assemble_evaluation(store, evs_sorted[0])
 
 
 # Module-level font registry — populated lazily on first PDF call
@@ -832,6 +830,7 @@ with st.sidebar.expander("Admin"):
 # UI: Sidebar navigation
 # ---------------------------
 page = st.sidebar.radio("Navegação", ["📊 Dashboard", "📝 Nova Avaliação", "➕ Cadastrar Jogador", "📚 Jogadores"])
+st.sidebar.caption("Modo preview: dados só nesta sessão (sem banco externo).")
 
 
 # ---------------------------
